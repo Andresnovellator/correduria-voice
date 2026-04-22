@@ -8,6 +8,7 @@ import os
 import json
 import base64
 import asyncio
+import unicodedata
 try:
     import audioop
 except ImportError:
@@ -37,6 +38,7 @@ SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8000").replace("https://", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "700"))
+HANGUP_AFTER_CLOSING_SECONDS = float(os.getenv("HANGUP_AFTER_CLOSING_SECONDS", "4.0"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
@@ -68,6 +70,9 @@ ESTILO DE CONVERSACIÓN
 - Si el cliente te interrumpe, te callas y escuchas.
 - No encadenes explicación + propuesta + incentivo en el mismo turno.
 - Después de cada respuesta, deja espacio para que el cliente hable.
+- No persigas al cliente ni intentes convencer a toda costa.
+- Si rechaza claramente 2 veces, cierra la llamada.
+- Si detectas molestia, prisa o rechazo fuerte, cierra enseguida.
 
 ESTRUCTURA FLEXIBLE
 1. Apertura:
@@ -126,6 +131,11 @@ Responde de forma natural, no como un guion literal.
 "¿Qué necesitáis?":
 "Solo una copia de la póliza, nada más."
 
+CIERRE POR RECHAZO
+Si el cliente rechaza claramente 2 veces, está molesto o tiene prisa, di exactamente:
+"Vale, no te molesto más. Gracias por atenderme, que tengas buen día."
+Después de esa frase, no sigas hablando.
+
 CIERRE FINAL
 Cuando acepte:
 "Perfecto, mándanos la póliza al 649 211 716 y la revisamos gratis."
@@ -147,6 +157,32 @@ def public_ws_url() -> str:
     if base.startswith("http://"):
         return "ws://" + base[len("http://"):]
     return f"wss://{base}"
+
+
+def normalize_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return value.lower()
+
+
+def is_closing_transcript(value: str) -> bool:
+    normalized = normalize_text(value)
+    return (
+        "no te molesto mas" in normalized
+        and "gracias por atenderme" in normalized
+    )
+
+
+async def hangup_twilio_call(call_sid: str):
+    if not call_sid:
+        return
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        await asyncio.to_thread(client.calls(call_sid).update, status="completed")
+        logger.info(f"📴 Llamada colgada por cierre amable: {call_sid}")
+    except Exception as e:
+        logger.error(f"❌ No se pudo colgar la llamada {call_sid}: {e}")
 
 @app.post("/incoming-call")
 async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str = Form("")):
@@ -178,8 +214,11 @@ async def media_stream(websocket: WebSocket):
     
     gemini_ws = None
     stream_sid = None
+    call_sid = None
     assistant_speaking = False
     last_clear_at = 0.0
+    closing_transcript = ""
+    hangup_scheduled = False
     
     try:
         # Conectar a Gemini Live API
@@ -216,7 +255,7 @@ async def media_stream(websocket: WebSocket):
         # Tareas paralelas
         async def twilio_to_gemini():
             """Recibe audio de Twilio y envía a Gemini"""
-            nonlocal stream_sid, assistant_speaking, last_clear_at
+            nonlocal stream_sid, call_sid, assistant_speaking, last_clear_at
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -224,8 +263,10 @@ async def media_stream(websocket: WebSocket):
                     logger.info(f"📨 Twilio event: {event}")
                     
                     if event == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        logger.info(f"📡 Stream: {stream_sid}")
+                        start = data.get("start", {})
+                        stream_sid = start.get("streamSid")
+                        call_sid = start.get("callSid")
+                        logger.info(f"📡 Stream: {stream_sid} Call: {call_sid}")
                         # Enviar saludo cuando Twilio esté listo
                         await gemini_ws.send(json.dumps({
                             "realtimeInput": {
@@ -274,7 +315,7 @@ async def media_stream(websocket: WebSocket):
         
         async def gemini_to_twilio():
             """Recibe audio de Gemini y envía a Twilio"""
-            nonlocal stream_sid, assistant_speaking
+            nonlocal stream_sid, assistant_speaking, closing_transcript, hangup_scheduled
             try:
                 async for message in gemini_ws:
                     data = json.loads(message)
@@ -303,9 +344,31 @@ async def media_stream(websocket: WebSocket):
                             
                             elif "text" in p:
                                 logger.info(f"🤖 Dice: {p['text'][:100]}")
+                                closing_transcript += p["text"]
+
+                        output_transcription = sc.get("outputTranscription") or sc.get("output_transcription")
+                        if isinstance(output_transcription, dict):
+                            text = output_transcription.get("text", "")
+                            if text:
+                                closing_transcript += text
+                                logger.info(f"📝 Gemini voz: {text[:100]}")
                         
                         if sc.get("turnComplete"):
                             assistant_speaking = False
+                            if (
+                                not hangup_scheduled
+                                and call_sid
+                                and is_closing_transcript(closing_transcript)
+                            ):
+                                hangup_scheduled = True
+                                logger.info("📴 Cierre detectado; colgando tras despedida")
+
+                                async def delayed_hangup():
+                                    await asyncio.sleep(HANGUP_AFTER_CLOSING_SECONDS)
+                                    await hangup_twilio_call(call_sid)
+
+                                asyncio.create_task(delayed_hangup())
+                            closing_transcript = ""
                     else:
                         keys = list(data.keys())
                         if keys != ["setupComplete"]:
