@@ -200,14 +200,6 @@ async def media_stream(websocket: WebSocket):
         
         logger.info("🤖 Gemini Live conectado")
         
-        # Iniciar conversación con texto
-        await gemini_ws.send(json.dumps({
-            "realtimeInput": {
-                "text": "Saluda de forma natural y preséntate como Lucía, de González Ardid, la correduría de Teruel. Baja la presión y haz una pregunta breve sobre su seguro de hogar."
-            }
-        }))
-        logger.info("📤 Saludo enviado a Gemini")
-        
         # Tareas paralelas
         async def twilio_to_gemini():
             """Recibe audio de Twilio y envía a Gemini"""
@@ -221,6 +213,13 @@ async def media_stream(websocket: WebSocket):
                     if event == "start":
                         stream_sid = data["start"]["streamSid"]
                         logger.info(f"📡 Stream: {stream_sid}")
+                        # Enviar saludo cuando Twilio esté listo
+                        await gemini_ws.send(json.dumps({
+                            "realtimeInput": {
+                                "text": "Saluda de forma natural y preséntate como Lucía, de González Ardid, la correduría de Teruel. Baja la presión y haz una pregunta breve sobre su seguro de hogar."
+                            }
+                        }))
+                        logger.info("📤 Saludo enviado a Gemini")
                     
                     elif event == "media":
                         payload = data["media"]["payload"]
@@ -231,10 +230,10 @@ async def media_stream(websocket: WebSocket):
                         
                         await gemini_ws.send(json.dumps({
                             "realtimeInput": {
-                                "mediaChunks": [{
+                                "audio": {
                                     "data": b64_pcm,
                                     "mimeType": "audio/pcm;rate=16000"
-                                }]
+                                }
                             }
                         }))
                     
