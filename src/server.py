@@ -1,5 +1,5 @@
 """
-Servidor Live: Gemini 3.1 Flash Live Preview + Twilio Media Streams
+Servidor Live: Gemini Live + Twilio Media Streams
 Audio bidireccional en tiempo real
 Correduría GYA - Teruel
 """
@@ -18,18 +18,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import sys
-logfile = open("/home/andres/correduria-voice/server.log", "a", buffering=1)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=[
-    logging.StreamHandler(sys.stdout),
-    logging.StreamHandler(logfile)
-])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger("correduria-voice")
 
 app = FastAPI()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "models/gemini-3.1-flash-live-preview"
-SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8000")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash-native-audio-latest")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8000").replace("https://", "").replace("http://", "").rstrip("/")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
@@ -63,17 +64,30 @@ CIERRE (si acepta):
 
 # ==================== WEBHOOK TWILIO ====================
 
+def public_http_url() -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    return f"https://{SERVER_HOST}"
+
+
+def public_ws_url() -> str:
+    base = public_http_url()
+    if base.startswith("https://"):
+        return "wss://" + base[len("https://"):]
+    if base.startswith("http://"):
+        return "ws://" + base[len("http://"):]
+    return f"wss://{base}"
+
 @app.post("/incoming-call")
 async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str = Form("")):
     logger.info(f"📞 Llamada: {From} -> {To} (SID: {CallSid})")
-    
-    ws_host = SERVER_HOST
+    media_stream_url = f"{public_ws_url()}/media-stream"
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="es-ES">Un momento, te conecto.</Say>
     <Connect>
-        <Stream url="wss://{ws_host}/media-stream" />
+        <Stream url="{media_stream_url}" />
     </Connect>
 </Response>"""
     
@@ -105,12 +119,18 @@ async def media_stream(websocket: WebSocket):
         setup = {
             "setup": {
                 "model": GEMINI_MODEL,
-                "generation_config": {
-                    "response_modalities": ["AUDIO"]
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": "Aoede"}
+                        }
+                    },
                 },
-                "system_instruction": {
+                "systemInstruction": {
                     "parts": [{"text": SYSTEM_PROMPT}]
-                }
+                },
+                "outputAudioTranscription": {},
             }
         }
         await gemini_ws.send(json.dumps(setup))
@@ -124,7 +144,7 @@ async def media_stream(websocket: WebSocket):
         
         # Iniciar conversación con texto
         await gemini_ws.send(json.dumps({
-            "realtime_input": {
+            "realtimeInput": {
                 "text": "Hola, saluda al cliente y preséntate como Lucía de Correduría GYA de Teruel. Ofrecele un estudio gratuito de su seguro de hogar."
             }
         }))
@@ -152,11 +172,11 @@ async def media_stream(websocket: WebSocket):
                         b64_pcm = base64.b64encode(pcm).decode()
                         
                         await gemini_ws.send(json.dumps({
-                            "realtime_input": {
-                                "audio": {
+                            "realtimeInput": {
+                                "mediaChunks": [{
                                     "data": b64_pcm,
-                                    "mime_type": "audio/pcm;rate=16000"
-                                }
+                                    "mimeType": "audio/pcm;rate=16000"
+                                }]
                             }
                         }))
                     
@@ -231,15 +251,16 @@ async def make_call(request: Request):
     call = client.calls.create(
         to=body["to"],
         from_=os.getenv("TWILIO_PHONE_NUMBER"),
-        url=f"https://{SERVER_HOST}/incoming-call",
+        url=f"{public_http_url()}/incoming-call",
         method="POST"
     )
     return {"status": "ok", "sid": call.sid}
 
 
 @app.get("/")
+@app.get("/health")
 async def health():
-    return {"ok": True, "model": "gemini-3.1-flash-live-preview", "mode": "real-time"}
+    return {"ok": True, "model": GEMINI_MODEL, "mode": "real-time"}
 
 
 if __name__ == "__main__":
