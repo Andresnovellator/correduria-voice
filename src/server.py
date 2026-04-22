@@ -36,6 +36,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8000").replace("https://", "").replace("http://", "").rstrip("/")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "700"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
@@ -52,15 +53,21 @@ OBJETIVO
 Conseguir, sin presionar, que el cliente envíe su póliza de seguro de hogar por WhatsApp al 649 211 716 para revisarla gratis.
 
 ESTILO DE CONVERSACIÓN
-- Frases muy cortas: 1 frase, máximo 2.
+- Frases ultra cortas: normalmente 5-10 palabras.
+- Responde con 1 frase. Solo usa 2 si es imprescindible.
 - Tono tranquilo, humano y relajado.
-- Usa expresiones naturales de vez en cuando: "vale", "claro", "perfecto", "ya", "mm".
+- Usa expresiones naturales de vez en cuando: "vale", "claro", "perfecto", "ya", "mm", "te entiendo".
+- Usa emoción suave: amable, sonriente, calmada.
+- Haz pequeñas pausas naturales; no aceleres.
 - No sueltes todo el discurso seguido.
 - Escucha y responde primero a lo que diga el cliente.
 - Haz preguntas sencillas para implicar al cliente.
 - No repitas siempre las mismas frases.
 - Si el cliente duda, baja la presión.
 - Si el cliente está receptivo, avanza hacia el WhatsApp.
+- Si el cliente te interrumpe, te callas y escuchas.
+- No encadenes explicación + propuesta + incentivo en el mismo turno.
+- Después de cada respuesta, deja espacio para que el cliente hable.
 
 ESTRUCTURA FLEXIBLE
 1. Apertura:
@@ -143,7 +150,6 @@ async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str =
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="es-ES">Un momento, te conecto.</Say>
     <Connect>
         <Stream url="{media_stream_url}" />
     </Connect>
@@ -167,6 +173,8 @@ async def media_stream(websocket: WebSocket):
     
     gemini_ws = None
     stream_sid = None
+    assistant_speaking = False
+    last_clear_at = 0.0
     
     try:
         # Conectar a Gemini Live API
@@ -203,7 +211,7 @@ async def media_stream(websocket: WebSocket):
         # Tareas paralelas
         async def twilio_to_gemini():
             """Recibe audio de Twilio y envía a Gemini"""
-            nonlocal stream_sid
+            nonlocal stream_sid, assistant_speaking, last_clear_at
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -225,6 +233,22 @@ async def media_stream(websocket: WebSocket):
                         payload = data["media"]["payload"]
                         audio_bytes = base64.b64decode(payload)
                         pcm = audioop.ulaw2lin(audio_bytes, 2)
+                        rms = audioop.rms(pcm, 2)
+                        now = asyncio.get_running_loop().time()
+                        if (
+                            assistant_speaking
+                            and stream_sid
+                            and rms >= BARGE_IN_RMS_THRESHOLD
+                            and now - last_clear_at > 0.8
+                        ):
+                            await websocket.send_text(json.dumps({
+                                "event": "clear",
+                                "streamSid": stream_sid
+                            }))
+                            assistant_speaking = False
+                            last_clear_at = now
+                            logger.info("🛑 Usuario interrumpe: limpiando audio de Twilio")
+
                         pcm = audioop.ratecv(pcm, 2, 1, 8000, 16000, None)[0]
                         b64_pcm = base64.b64encode(pcm).decode()
                         
@@ -245,7 +269,7 @@ async def media_stream(websocket: WebSocket):
         
         async def gemini_to_twilio():
             """Recibe audio de Gemini y envía a Twilio"""
-            nonlocal stream_sid
+            nonlocal stream_sid, assistant_speaking
             try:
                 async for message in gemini_ws:
                     data = json.loads(message)
@@ -270,9 +294,13 @@ async def media_stream(websocket: WebSocket):
                                         "streamSid": stream_sid,
                                         "media": {"payload": b64_mulaw}
                                     }))
+                                    assistant_speaking = True
                             
                             elif "text" in p:
                                 logger.info(f"🤖 Dice: {p['text'][:100]}")
+                        
+                        if sc.get("turnComplete"):
+                            assistant_speaking = False
                     else:
                         keys = list(data.keys())
                         if keys != ["setupComplete"]:
