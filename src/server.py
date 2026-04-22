@@ -8,7 +8,10 @@ import os
 import json
 import base64
 import asyncio
-import audioop
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
 import logging
 import websockets
 from fastapi import FastAPI, WebSocket, Request, Form
