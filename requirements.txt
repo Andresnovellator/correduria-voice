@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.45.0
+websockets==16.0
+twilio==9.10.5
+python-dotenv==1.2.2
+edge-tts==7.2.8
+python-multipart==0.0.26
