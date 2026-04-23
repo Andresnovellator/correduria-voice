@@ -286,6 +286,7 @@ async def media_stream(websocket: WebSocket):
     logger.info("🔌 Twilio WebSocket conectado")
     
     gemini_ws = None
+    gemini_ready = asyncio.Event()
     stream_sid = None
     call_sid = None
     assistant_speaking = False
@@ -329,6 +330,7 @@ async def media_stream(websocket: WebSocket):
             resp = json.loads(await asyncio.wait_for(gemini_ws.recv(), timeout=10))
             if "setupComplete" not in resp:
                 raise RuntimeError(f"Gemini setup falló: {resp}")
+            gemini_ready.set()
             logger.info("🤖 Gemini Live conectado")
 
         async def max_duration_hangup():
@@ -362,7 +364,11 @@ async def media_stream(websocket: WebSocket):
                         if not max_duration_task:
                             max_duration_task = asyncio.create_task(max_duration_hangup())
                         if not gemini_ws:
-                            await connect_gemini(call_context)
+                            try:
+                                await connect_gemini(call_context)
+                            except Exception as e:
+                                logger.error(f"❌ Error conectando Gemini: {e}")
+                                break
                         # Contexto privado ya va en systemInstruction; aquí solo forzamos el inicio de la llamada.
                         await gemini_ws.send(json.dumps({
                             "clientContent": {
@@ -411,8 +417,7 @@ async def media_stream(websocket: WebSocket):
             """Recibe audio de Gemini y envía a Twilio"""
             nonlocal stream_sid, assistant_speaking
             try:
-                while gemini_ws is None:
-                    await asyncio.sleep(0.01)
+                await gemini_ready.wait()
                 async for message in gemini_ws:
                     data = json.loads(message)
                     sc = data.get("serverContent")
