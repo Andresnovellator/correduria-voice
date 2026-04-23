@@ -9,13 +9,15 @@ import json
 import base64
 import asyncio
 import unicodedata
+import uuid
+from urllib.parse import quote
 try:
     import audioop
 except ImportError:
     import audioop_lts as audioop
 import logging
 import websockets
-from fastapi import FastAPI, WebSocket, Request, Form
+from fastapi import FastAPI, WebSocket, Request, Form, HTTPException
 from fastapi.responses import Response
 from dotenv import load_dotenv
 
@@ -37,11 +39,14 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8000").replace("https://", "").replace("http://", "").rstrip("/")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "700"))
+BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "1200"))
+BARGE_IN_REQUIRED_FRAMES = int(os.getenv("BARGE_IN_REQUIRED_FRAMES", "8"))
 HANGUP_AFTER_CLOSING_SECONDS = float(os.getenv("HANGUP_AFTER_CLOSING_SECONDS", "4.0"))
 HANGUP_AFTER_REJECTION_SECONDS = float(os.getenv("HANGUP_AFTER_REJECTION_SECONDS", "7.0"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+
+CALL_CONTEXTS: dict[str, dict[str, str]] = {}
 
 SYSTEM_PROMPT = """IDENTIDAD
 Eres Lucía, de la correduría González Ardid, también llamada Correduría GYA, en Teruel.
@@ -166,6 +171,37 @@ def normalize_text(value: str) -> str:
     return value.lower()
 
 
+def clean_field(value, limit: int) -> str:
+    if value is None:
+        return ""
+    value = str(value).strip()
+    return " ".join(value.split())[:limit]
+
+
+def build_call_context_instruction(context: dict[str, str]) -> str:
+    name = context.get("name", "")
+    company = context.get("company", "")
+    notes = context.get("context", "")
+    lines = [
+        "Datos específicos de esta llamada. Úsalos como contexto privado, no los leas de forma literal.",
+        "No inventes información que no esté aquí.",
+    ]
+    if name:
+        lines.append(f"Nombre de la persona: {name}. Puedes usar su nombre de forma natural, sin repetirlo demasiado.")
+    if company:
+        lines.append(f"Empresa o actividad relacionada: {company}. Menciónala solo si encaja en la conversación.")
+    if notes:
+        lines.append(f"Contexto adicional: {notes}")
+
+    if name:
+        opening = f"Hola, ¿{name}? Soy Lucía, de González Ardid, la correduría de Teruel."
+    else:
+        opening = "Hola, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
+
+    lines.append(f'Di solo esta apertura y después deja espacio: "{opening}"')
+    return "\n".join(lines)
+
+
 def is_closing_transcript(value: str) -> bool:
     normalized = normalize_text(value)
     return (
@@ -216,9 +252,11 @@ async def hangup_twilio_call(call_sid: str):
         logger.error(f"❌ No se pudo colgar la llamada {call_sid}: {e}")
 
 @app.post("/incoming-call")
-async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str = Form("")):
+async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str = Form(""), ctx: str = ""):
     logger.info(f"📞 Llamada: {From} -> {To} (SID: {CallSid})")
     media_stream_url = f"{public_ws_url()}/media-stream"
+    if ctx:
+        media_stream_url = f"{media_stream_url}?ctx={quote(ctx)}"
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -248,10 +286,20 @@ async def media_stream(websocket: WebSocket):
     call_sid = None
     assistant_speaking = False
     last_clear_at = 0.0
+    barge_in_voice_frames = 0
     closing_transcript = ""
     hangup_scheduled = False
     rejection_count = 0
     last_rejection_at = 0.0
+    ctx_token = websocket.query_params.get("ctx", "")
+    call_context = CALL_CONTEXTS.get(ctx_token, {})
+    if call_context:
+        logger.info(
+            "🧩 Contexto de llamada cargado: "
+            f"name={bool(call_context.get('name'))} "
+            f"company={bool(call_context.get('company'))} "
+            f"context={bool(call_context.get('context'))}"
+        )
     
     try:
         # Conectar a Gemini Live API
@@ -285,11 +333,26 @@ async def media_stream(websocket: WebSocket):
             return
         
         logger.info("🤖 Gemini Live conectado")
+
+        async def clear_twilio_audio(reason: str):
+            nonlocal assistant_speaking, last_clear_at
+            if not stream_sid:
+                return
+            now = asyncio.get_running_loop().time()
+            if now - last_clear_at <= 0.8:
+                return
+            await websocket.send_text(json.dumps({
+                "event": "clear",
+                "streamSid": stream_sid
+            }))
+            assistant_speaking = False
+            last_clear_at = now
+            logger.info(f"🛑 Interrupción del cliente ({reason}): limpiando audio de Twilio")
         
         # Tareas paralelas
         async def twilio_to_gemini():
             """Recibe audio de Twilio y envía a Gemini"""
-            nonlocal stream_sid, call_sid, assistant_speaking, last_clear_at
+            nonlocal stream_sid, call_sid, assistant_speaking, barge_in_voice_frames
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -304,7 +367,7 @@ async def media_stream(websocket: WebSocket):
                         # Enviar saludo cuando Twilio esté listo
                         await gemini_ws.send(json.dumps({
                             "realtimeInput": {
-                                "text": "Di solo esta apertura y después deja espacio: Hola, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
+                                "text": build_call_context_instruction(call_context)
                             }
                         }))
                         logger.info("📤 Saludo enviado a Gemini")
@@ -314,20 +377,14 @@ async def media_stream(websocket: WebSocket):
                         audio_bytes = base64.b64decode(payload)
                         pcm = audioop.ulaw2lin(audio_bytes, 2)
                         rms = audioop.rms(pcm, 2)
-                        now = asyncio.get_running_loop().time()
-                        if (
-                            assistant_speaking
-                            and stream_sid
-                            and rms >= BARGE_IN_RMS_THRESHOLD
-                            and now - last_clear_at > 0.8
-                        ):
-                            await websocket.send_text(json.dumps({
-                                "event": "clear",
-                                "streamSid": stream_sid
-                            }))
-                            assistant_speaking = False
-                            last_clear_at = now
-                            logger.info("🛑 Usuario interrumpe: limpiando audio de Twilio")
+                        if assistant_speaking and rms >= BARGE_IN_RMS_THRESHOLD:
+                            barge_in_voice_frames += 1
+                        else:
+                            barge_in_voice_frames = 0
+
+                        if assistant_speaking and barge_in_voice_frames >= BARGE_IN_REQUIRED_FRAMES:
+                            await clear_twilio_audio("voz sostenida")
+                            barge_in_voice_frames = 0
 
                         pcm = audioop.ratecv(pcm, 2, 1, 8000, 16000, None)[0]
                         b64_pcm = base64.b64encode(pcm).decode()
@@ -393,6 +450,9 @@ async def media_stream(websocket: WebSocket):
                             user_text = input_transcription.get("text", "")
                             if user_text:
                                 logger.info(f"📝 Cliente: {user_text[:100]}")
+                                if assistant_speaking:
+                                    await clear_twilio_audio("transcripción de voz")
+
                                 level = rejection_level(user_text)
                                 now = asyncio.get_running_loop().time()
                                 if level and now - last_rejection_at > 2.5:
@@ -461,6 +521,8 @@ async def media_stream(websocket: WebSocket):
     finally:
         if gemini_ws:
             await gemini_ws.close()
+        if ctx_token:
+            CALL_CONTEXTS.pop(ctx_token, None)
         logger.info("🔌 Cerrado")
 
 
@@ -470,14 +532,36 @@ async def media_stream(websocket: WebSocket):
 async def make_call(request: Request):
     from twilio.rest import Client
     body = await request.json()
+    phone_to = clean_field(body.get("to"), 32)
+    if not phone_to:
+        raise HTTPException(status_code=400, detail="El campo 'to' es obligatorio")
+
+    call_context = {
+        "name": clean_field(body.get("name"), 80),
+        "company": clean_field(body.get("company"), 140),
+        "context": clean_field(body.get("context"), 600),
+    }
+    ctx_token = uuid.uuid4().hex
+    CALL_CONTEXTS[ctx_token] = call_context
+
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    call = client.calls.create(
-        to=body["to"],
-        from_=os.getenv("TWILIO_PHONE_NUMBER"),
-        url=f"{public_http_url()}/incoming-call",
-        method="POST"
-    )
-    return {"status": "ok", "sid": call.sid}
+    try:
+        call = client.calls.create(
+            to=phone_to,
+            from_=os.getenv("TWILIO_PHONE_NUMBER"),
+            url=f"{public_http_url()}/incoming-call?ctx={quote(ctx_token)}",
+            method="POST"
+        )
+    except Exception:
+        CALL_CONTEXTS.pop(ctx_token, None)
+        raise
+
+    return {
+        "status": "ok",
+        "sid": call.sid,
+        "to": phone_to,
+        "context": call_context,
+    }
 
 
 @app.get("/")
