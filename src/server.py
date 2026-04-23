@@ -8,7 +8,6 @@ import os
 import json
 import base64
 import asyncio
-import unicodedata
 import uuid
 from urllib.parse import quote
 try:
@@ -41,8 +40,6 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "1200"))
 BARGE_IN_REQUIRED_FRAMES = int(os.getenv("BARGE_IN_REQUIRED_FRAMES", "8"))
-HANGUP_AFTER_CLOSING_SECONDS = float(os.getenv("HANGUP_AFTER_CLOSING_SECONDS", "4.0"))
-HANGUP_AFTER_REJECTION_SECONDS = float(os.getenv("HANGUP_AFTER_REJECTION_SECONDS", "7.0"))
 CALL_MAX_SECONDS = float(os.getenv("CALL_MAX_SECONDS", "300"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -185,13 +182,6 @@ def public_ws_url() -> str:
         return "ws://" + base[len("http://"):]
     return f"wss://{base}"
 
-
-def normalize_text(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value or "")
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    return value.lower()
-
-
 def clean_field(value, limit: int) -> str:
     if value is None:
         return ""
@@ -223,44 +213,6 @@ def build_call_context_instruction(context: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def is_closing_transcript(value: str) -> bool:
-    normalized = normalize_text(value)
-    return (
-        "no te molesto mas" in normalized
-        and "gracias por atenderme" in normalized
-    )
-
-
-def rejection_level(value: str) -> str:
-    normalized = normalize_text(value)
-    strong_patterns = [
-        "no me llames",
-        "deja de llamar",
-        "no vuelvas a llamar",
-        "borrame",
-        "eliminame",
-        "cuelga",
-        "estoy ocupado",
-        "no tengo tiempo",
-        "me molestas",
-        "molestando",
-    ]
-    soft_patterns = [
-        "no me interesa",
-        "no quiero",
-        "no gracias",
-        "paso",
-        "nada gracias",
-        "no necesito",
-        "no hace falta",
-    ]
-    if any(pattern in normalized for pattern in strong_patterns):
-        return "strong"
-    if any(pattern in normalized for pattern in soft_patterns):
-        return "soft"
-    return ""
-
-
 async def hangup_twilio_call(call_sid: str):
     if not call_sid:
         return
@@ -273,9 +225,10 @@ async def hangup_twilio_call(call_sid: str):
         logger.error(f"❌ No se pudo colgar la llamada {call_sid}: {e}")
 
 @app.post("/incoming-call")
-async def incoming_call(CallSid: str = Form(""), From: str = Form(""), To: str = Form(""), ctx: str = ""):
+async def incoming_call(request: Request, CallSid: str = Form(""), From: str = Form(""), To: str = Form("")):
     logger.info(f"📞 Llamada: {From} -> {To} (SID: {CallSid})")
     media_stream_url = f"{public_ws_url()}/media-stream"
+    ctx = request.query_params.get("ctx", "")
     if ctx:
         media_stream_url = f"{media_stream_url}?ctx={quote(ctx)}"
     
@@ -308,7 +261,6 @@ async def media_stream(websocket: WebSocket):
     assistant_speaking = False
     last_clear_at = 0.0
     barge_in_voice_frames = 0
-    closing_transcript = ""
     max_duration_task = None
     ctx_token = websocket.query_params.get("ctx", "")
     call_context = CALL_CONTEXTS.get(ctx_token, {})
@@ -340,7 +292,6 @@ async def media_stream(websocket: WebSocket):
                 "systemInstruction": {
                     "parts": [{"text": SYSTEM_PROMPT}]
                 },
-                "outputAudioTranscription": {},
                 "inputAudioTranscription": {},
             }
         }
@@ -382,7 +333,8 @@ async def media_stream(websocket: WebSocket):
                 async for message in websocket.iter_text():
                     data = json.loads(message)
                     event = data.get("event")
-                    logger.info(f"📨 Twilio event: {event}")
+                    if event != "media":
+                        logger.info(f"📨 Twilio event: {event}")
                     
                     if event == "start":
                         start = data.get("start", {})
@@ -433,7 +385,7 @@ async def media_stream(websocket: WebSocket):
         
         async def gemini_to_twilio():
             """Recibe audio de Gemini y envía a Twilio"""
-            nonlocal stream_sid, assistant_speaking, closing_transcript
+            nonlocal stream_sid, assistant_speaking
             try:
                 async for message in gemini_ws:
                     data = json.loads(message)
@@ -441,7 +393,8 @@ async def media_stream(websocket: WebSocket):
                     
                     if sc:
                         parts = sc.get("modelTurn", {}).get("parts", [])
-                        logger.info(f"🤖 Gemini response: {len(parts)} parts")
+                        if parts:
+                            logger.info(f"🤖 Gemini response: {len(parts)} parts")
                         for p in parts:
                             if "inlineData" in p and stream_sid:
                                 b64_audio = p["inlineData"].get("data", "")
@@ -462,14 +415,6 @@ async def media_stream(websocket: WebSocket):
                             
                             elif "text" in p:
                                 logger.info(f"🤖 Dice: {p['text'][:100]}")
-                                closing_transcript += p["text"]
-
-                        output_transcription = sc.get("outputTranscription") or sc.get("output_transcription")
-                        if isinstance(output_transcription, dict):
-                            text = output_transcription.get("text", "")
-                            if text:
-                                closing_transcript += text
-                                logger.info(f"📝 Gemini voz: {text[:100]}")
 
                         input_transcription = sc.get("inputTranscription") or sc.get("input_transcription")
                         if isinstance(input_transcription, dict):
@@ -481,7 +426,6 @@ async def media_stream(websocket: WebSocket):
                         
                         if sc.get("turnComplete"):
                             assistant_speaking = False
-                            closing_transcript = ""
                     else:
                         keys = list(data.keys())
                         if keys != ["setupComplete"]:
