@@ -9,6 +9,7 @@ import json
 import base64
 import asyncio
 import uuid
+import itertools
 from urllib.parse import quote
 try:
     import audioop
@@ -290,6 +291,7 @@ async def media_stream(websocket: WebSocket):
     stream_sid = None
     call_sid = None
     assistant_speaking = False
+    outbound_mark_counter = itertools.count(1)
     barge_in_voice_frames = 0
     max_duration_task = None
     ctx_token = websocket.query_params.get("ctx", "")
@@ -441,6 +443,13 @@ async def media_stream(websocket: WebSocket):
                                         "event": "media",
                                         "streamSid": stream_sid,
                                         "media": {"payload": b64_mulaw}
+                                    }))
+                                    await websocket.send_text(json.dumps({
+                                        "event": "mark",
+                                        "streamSid": stream_sid,
+                                        "mark": {
+                                            "name": f"audio-{next(outbound_mark_counter)}"
+                                        }
                                     }))
                                     assistant_speaking = True
                             
