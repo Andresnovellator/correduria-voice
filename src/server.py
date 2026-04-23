@@ -43,6 +43,7 @@ BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "1200"))
 BARGE_IN_REQUIRED_FRAMES = int(os.getenv("BARGE_IN_REQUIRED_FRAMES", "8"))
 HANGUP_AFTER_CLOSING_SECONDS = float(os.getenv("HANGUP_AFTER_CLOSING_SECONDS", "4.0"))
 HANGUP_AFTER_REJECTION_SECONDS = float(os.getenv("HANGUP_AFTER_REJECTION_SECONDS", "7.0"))
+CALL_MAX_SECONDS = float(os.getenv("CALL_MAX_SECONDS", "300"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
@@ -55,7 +56,8 @@ Hablas como una persona real, cercana y natural. No suenas a robot ni a comercia
 
 SITUACIÓN
 Estás llamando a un cliente que no espera la llamada.
-No menciones a Andrés ni digas que alguien te ha pasado su contacto.
+No digas que alguien te ha pasado su contacto.
+Si recibes un nombre de cliente para esta llamada, úsalo de forma natural.
 
 OBJETIVO
 Conseguir, sin presionar, que el cliente envíe una copia de alguna póliza de seguro por WhatsApp al 649 211 716 para revisarla gratis.
@@ -76,14 +78,18 @@ ESTILO DE CONVERSACIÓN
 - Si el cliente te interrumpe, te callas y escuchas.
 - No encadenes explicación + propuesta + incentivo en el mismo turno.
 - Después de cada respuesta, deja espacio para que el cliente hable.
-- No persigas al cliente ni intentes convencer a toda costa.
-- Si rechaza claramente 2 veces, cierra la llamada.
-- Si detectas molestia, prisa o rechazo fuerte, cierra enseguida.
+- Puedes insistir con calma si el cliente dice que no le interesa al principio.
+- No cierres la llamada por un primer rechazo suave.
+- Si hay rechazo, prueba varios enfoques: ahorro, revisión gratuita, mismas coberturas, no compromiso y WhatsApp sencillo.
+- Intenta explicar el valor de la revisión con frases cortas y distintas.
+- Si el cliente no cuelga, sigue intentando avanzar hacia el WhatsApp de forma natural.
+- No hagas monólogos largos ni suenes agresiva.
 
 ESTRUCTURA FLEXIBLE
 1. Apertura:
-   Di solo:
+   Si no tienes nombre de cliente, di solo:
    "Hola, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
+   Si tienes nombre de cliente, saluda usando ese nombre de forma natural.
    Después de la apertura, haz una pausa breve y deja espacio por si el cliente contesta.
 
 2. Contexto:
@@ -120,7 +126,10 @@ OBJECIONES
 Responde de forma natural, no como un guion literal.
 
 "No me interesa":
-"Vale, sin problema. Es solo revisar si se puede mejorar."
+"Ya, te entiendo. Es solo revisar si se puede mejorar, sin cambiar nada."
+
+"No me interesa nada":
+"Claro, te entiendo. Aun así, muchas veces solo con mirar la póliza vemos si estás pagando de más."
 
 "Ya tengo seguro":
 "Claro, justo por eso lo miramos: precio y coberturas."
@@ -136,11 +145,6 @@ Responde de forma natural, no como un guion literal.
 
 "¿Qué necesitáis?":
 "Solo una copia de la póliza, nada más."
-
-CIERRE POR RECHAZO
-Si el cliente rechaza claramente 2 veces, está molesto o tiene prisa, di exactamente:
-"Vale, no te molesto más. Gracias por atenderme, que tengas buen día."
-Después de esa frase, no sigas hablando.
 
 CIERRE FINAL
 Cuando acepte:
@@ -187,14 +191,17 @@ def build_call_context_instruction(context: dict[str, str]) -> str:
         "No inventes información que no esté aquí.",
     ]
     if name:
-        lines.append(f"Nombre de la persona: {name}. Puedes usar su nombre de forma natural, sin repetirlo demasiado.")
+        lines.append(
+            f"Nombre de la persona: {name}. Usa este nombre en la apertura y vuelve a usarlo alguna vez si encaja. "
+            "Si el nombre es Andrés, trátalo como nombre del cliente, no como referencia."
+        )
     if company:
         lines.append(f"Empresa o actividad relacionada: {company}. Menciónala solo si encaja en la conversación.")
     if notes:
         lines.append(f"Contexto adicional: {notes}")
 
     if name:
-        opening = f"Hola, ¿{name}? Soy Lucía, de González Ardid, la correduría de Teruel."
+        opening = f"Hola {name}, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
     else:
         opening = "Hola, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
 
@@ -288,9 +295,7 @@ async def media_stream(websocket: WebSocket):
     last_clear_at = 0.0
     barge_in_voice_frames = 0
     closing_transcript = ""
-    hangup_scheduled = False
-    rejection_count = 0
-    last_rejection_at = 0.0
+    max_duration_task = None
     ctx_token = websocket.query_params.get("ctx", "")
     call_context = CALL_CONTEXTS.get(ctx_token, {})
     if call_context:
@@ -348,11 +353,17 @@ async def media_stream(websocket: WebSocket):
             assistant_speaking = False
             last_clear_at = now
             logger.info(f"🛑 Interrupción del cliente ({reason}): limpiando audio de Twilio")
+
+        async def max_duration_hangup():
+            await asyncio.sleep(CALL_MAX_SECONDS)
+            if call_sid:
+                logger.info(f"⏱️ Límite de {CALL_MAX_SECONDS:.0f}s alcanzado; colgando llamada")
+                await hangup_twilio_call(call_sid)
         
         # Tareas paralelas
         async def twilio_to_gemini():
             """Recibe audio de Twilio y envía a Gemini"""
-            nonlocal stream_sid, call_sid, assistant_speaking, barge_in_voice_frames
+            nonlocal stream_sid, call_sid, assistant_speaking, barge_in_voice_frames, max_duration_task
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -364,6 +375,8 @@ async def media_stream(websocket: WebSocket):
                         stream_sid = start.get("streamSid")
                         call_sid = start.get("callSid")
                         logger.info(f"📡 Stream: {stream_sid} Call: {call_sid}")
+                        if not max_duration_task:
+                            max_duration_task = asyncio.create_task(max_duration_hangup())
                         # Enviar saludo cuando Twilio esté listo
                         await gemini_ws.send(json.dumps({
                             "realtimeInput": {
@@ -406,8 +419,7 @@ async def media_stream(websocket: WebSocket):
         
         async def gemini_to_twilio():
             """Recibe audio de Gemini y envía a Twilio"""
-            nonlocal stream_sid, assistant_speaking, closing_transcript, hangup_scheduled
-            nonlocal rejection_count, last_rejection_at
+            nonlocal stream_sid, assistant_speaking, closing_transcript
             try:
                 async for message in gemini_ws:
                     data = json.loads(message)
@@ -452,52 +464,9 @@ async def media_stream(websocket: WebSocket):
                                 logger.info(f"📝 Cliente: {user_text[:100]}")
                                 if assistant_speaking:
                                     await clear_twilio_audio("transcripción de voz")
-
-                                level = rejection_level(user_text)
-                                now = asyncio.get_running_loop().time()
-                                if level and now - last_rejection_at > 2.5:
-                                    rejection_count += 2 if level == "strong" else 1
-                                    last_rejection_at = now
-                                    logger.info(f"🚪 Rechazo detectado ({level}); contador={rejection_count}")
-
-                                if (
-                                    not hangup_scheduled
-                                    and call_sid
-                                    and (level == "strong" or rejection_count >= 2)
-                                ):
-                                    hangup_scheduled = True
-                                    logger.info("📴 Rechazo suficiente; pidiendo despedida y colgado")
-                                    await gemini_ws.send(json.dumps({
-                                        "realtimeInput": {
-                                            "text": (
-                                                "El cliente no quiere seguir. Di exactamente: "
-                                                "Vale, no te molesto más. Gracias por atenderme, que tengas buen día. "
-                                                "Después no digas nada más."
-                                            )
-                                        }
-                                    }))
-
-                                    async def delayed_hangup_after_rejection():
-                                        await asyncio.sleep(HANGUP_AFTER_REJECTION_SECONDS)
-                                        await hangup_twilio_call(call_sid)
-
-                                    asyncio.create_task(delayed_hangup_after_rejection())
                         
                         if sc.get("turnComplete"):
                             assistant_speaking = False
-                            if (
-                                not hangup_scheduled
-                                and call_sid
-                                and is_closing_transcript(closing_transcript)
-                            ):
-                                hangup_scheduled = True
-                                logger.info("📴 Cierre detectado; colgando tras despedida")
-
-                                async def delayed_hangup():
-                                    await asyncio.sleep(HANGUP_AFTER_CLOSING_SECONDS)
-                                    await hangup_twilio_call(call_sid)
-
-                                asyncio.create_task(delayed_hangup())
                             closing_transcript = ""
                     else:
                         keys = list(data.keys())
@@ -519,6 +488,8 @@ async def media_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"❌ Error: {e}")
     finally:
+        if max_duration_task:
+            max_duration_task.cancel()
         if gemini_ws:
             await gemini_ws.close()
         if ctx_token:
