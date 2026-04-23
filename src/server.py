@@ -39,6 +39,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 BARGE_IN_RMS_THRESHOLD = int(os.getenv("BARGE_IN_RMS_THRESHOLD", "700"))
 HANGUP_AFTER_CLOSING_SECONDS = float(os.getenv("HANGUP_AFTER_CLOSING_SECONDS", "4.0"))
+HANGUP_AFTER_REJECTION_SECONDS = float(os.getenv("HANGUP_AFTER_REJECTION_SECONDS", "7.0"))
 
 GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
@@ -173,6 +174,36 @@ def is_closing_transcript(value: str) -> bool:
     )
 
 
+def rejection_level(value: str) -> str:
+    normalized = normalize_text(value)
+    strong_patterns = [
+        "no me llames",
+        "deja de llamar",
+        "no vuelvas a llamar",
+        "borrame",
+        "eliminame",
+        "cuelga",
+        "estoy ocupado",
+        "no tengo tiempo",
+        "me molestas",
+        "molestando",
+    ]
+    soft_patterns = [
+        "no me interesa",
+        "no quiero",
+        "no gracias",
+        "paso",
+        "nada gracias",
+        "no necesito",
+        "no hace falta",
+    ]
+    if any(pattern in normalized for pattern in strong_patterns):
+        return "strong"
+    if any(pattern in normalized for pattern in soft_patterns):
+        return "soft"
+    return ""
+
+
 async def hangup_twilio_call(call_sid: str):
     if not call_sid:
         return
@@ -219,6 +250,8 @@ async def media_stream(websocket: WebSocket):
     last_clear_at = 0.0
     closing_transcript = ""
     hangup_scheduled = False
+    rejection_count = 0
+    last_rejection_at = 0.0
     
     try:
         # Conectar a Gemini Live API
@@ -241,6 +274,7 @@ async def media_stream(websocket: WebSocket):
                     "parts": [{"text": SYSTEM_PROMPT}]
                 },
                 "outputAudioTranscription": {},
+                "inputAudioTranscription": {},
             }
         }
         await gemini_ws.send(json.dumps(setup))
@@ -316,6 +350,7 @@ async def media_stream(websocket: WebSocket):
         async def gemini_to_twilio():
             """Recibe audio de Gemini y envía a Twilio"""
             nonlocal stream_sid, assistant_speaking, closing_transcript, hangup_scheduled
+            nonlocal rejection_count, last_rejection_at
             try:
                 async for message in gemini_ws:
                     data = json.loads(message)
@@ -352,6 +387,41 @@ async def media_stream(websocket: WebSocket):
                             if text:
                                 closing_transcript += text
                                 logger.info(f"📝 Gemini voz: {text[:100]}")
+
+                        input_transcription = sc.get("inputTranscription") or sc.get("input_transcription")
+                        if isinstance(input_transcription, dict):
+                            user_text = input_transcription.get("text", "")
+                            if user_text:
+                                logger.info(f"📝 Cliente: {user_text[:100]}")
+                                level = rejection_level(user_text)
+                                now = asyncio.get_running_loop().time()
+                                if level and now - last_rejection_at > 2.5:
+                                    rejection_count += 2 if level == "strong" else 1
+                                    last_rejection_at = now
+                                    logger.info(f"🚪 Rechazo detectado ({level}); contador={rejection_count}")
+
+                                if (
+                                    not hangup_scheduled
+                                    and call_sid
+                                    and (level == "strong" or rejection_count >= 2)
+                                ):
+                                    hangup_scheduled = True
+                                    logger.info("📴 Rechazo suficiente; pidiendo despedida y colgado")
+                                    await gemini_ws.send(json.dumps({
+                                        "realtimeInput": {
+                                            "text": (
+                                                "El cliente no quiere seguir. Di exactamente: "
+                                                "Vale, no te molesto más. Gracias por atenderme, que tengas buen día. "
+                                                "Después no digas nada más."
+                                            )
+                                        }
+                                    }))
+
+                                    async def delayed_hangup_after_rejection():
+                                        await asyncio.sleep(HANGUP_AFTER_REJECTION_SECONDS)
+                                        await hangup_twilio_call(call_sid)
+
+                                    asyncio.create_task(delayed_hangup_after_rejection())
                         
                         if sc.get("turnComplete"):
                             assistant_speaking = False
