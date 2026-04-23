@@ -214,6 +214,25 @@ def build_call_context_prompt(context: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def xml_escape(value: str) -> str:
+    return (
+        (value or "")
+        .replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def build_opening_instruction(context: dict[str, str]) -> str:
+    prompt = build_call_context_prompt(context)
+    return (
+        f"{prompt}\n"
+        "Empieza la llamada ahora mismo con esa apertura exacta. "
+        "Después sigue de forma natural, en español, con frases cortas."
+    )
+
+
 async def hangup_twilio_call(call_sid: str):
     if not call_sid:
         return
@@ -230,13 +249,23 @@ async def incoming_call(request: Request, CallSid: str = Form(""), From: str = F
     logger.info(f"📞 Llamada: {From} -> {To} (SID: {CallSid})")
     media_stream_url = f"{public_ws_url()}/media-stream"
     ctx = request.query_params.get("ctx", "")
-    if ctx:
-        media_stream_url = f"{media_stream_url}?ctx={quote(ctx)}"
+    call_context = CALL_CONTEXTS.get(ctx, {}) if ctx else {}
+    parameter_lines = []
+    for key in ("name", "company", "context"):
+        value = clean_field(call_context.get(key), 600 if key == "context" else 140)
+        if value:
+            parameter_lines.append(
+                f'        <Parameter name="{key}" value="{xml_escape(value)}" />'
+            )
+    parameters_block = ""
+    if parameter_lines:
+        parameters_block = "\n" + "\n".join(parameter_lines)
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{media_stream_url}" />
+        <Stream url="{media_stream_url}">{parameters_block}
+        </Stream>
     </Connect>
 </Response>"""
     
@@ -260,68 +289,47 @@ async def media_stream(websocket: WebSocket):
     stream_sid = None
     call_sid = None
     assistant_speaking = False
-    last_clear_at = 0.0
     barge_in_voice_frames = 0
     max_duration_task = None
     ctx_token = websocket.query_params.get("ctx", "")
-    call_context = CALL_CONTEXTS.get(ctx_token, {})
-    session_system_prompt = SYSTEM_PROMPT
-    if call_context:
-        session_system_prompt = f"{SYSTEM_PROMPT}\n\n{build_call_context_prompt(call_context)}"
-    if call_context:
-        logger.info(
-            "🧩 Contexto de llamada cargado: "
-            f"name={bool(call_context.get('name'))} "
-            f"company={bool(call_context.get('company'))} "
-            f"context={bool(call_context.get('context'))}"
-        )
     
     try:
-        # Conectar a Gemini Live API
-        gemini_url = f"{GEMINI_WS_URL}?key={GEMINI_API_KEY}"
-        gemini_ws = await websockets.connect(gemini_url, ping_interval=20, ping_timeout=60)
-        
-        # Setup
-        setup = {
-            "setup": {
-                "model": GEMINI_MODEL,
-                "generationConfig": {
-                    "responseModalities": ["AUDIO"],
-                    "speechConfig": {
-                        "voiceConfig": {
-                            "prebuiltVoiceConfig": {"voiceName": "Aoede"}
-                        }
-                    },
-                },
-                "systemInstruction": {
-                    "parts": [{"text": session_system_prompt}]
-                },
-                "inputAudioTranscription": {},
-            }
-        }
-        await gemini_ws.send(json.dumps(setup))
-        resp = json.loads(await asyncio.wait_for(gemini_ws.recv(), timeout=10))
-        
-        if "setupComplete" not in resp:
-            logger.error(f"Gemini setup falló: {resp}")
-            return
-        
-        logger.info("🤖 Gemini Live conectado")
+        async def connect_gemini(call_context: dict[str, str]):
+            nonlocal gemini_ws
+            session_system_prompt = SYSTEM_PROMPT
+            if call_context:
+                session_system_prompt = f"{SYSTEM_PROMPT}\n\n{build_call_context_prompt(call_context)}"
+                logger.info(
+                    "🧩 Contexto de llamada cargado: "
+                    f"name={bool(call_context.get('name'))} "
+                    f"company={bool(call_context.get('company'))} "
+                    f"context={bool(call_context.get('context'))}"
+                )
 
-        async def clear_twilio_audio(reason: str):
-            nonlocal assistant_speaking, last_clear_at
-            if not stream_sid:
-                return
-            now = asyncio.get_running_loop().time()
-            if now - last_clear_at <= 0.8:
-                return
-            await websocket.send_text(json.dumps({
-                "event": "clear",
-                "streamSid": stream_sid
-            }))
-            assistant_speaking = False
-            last_clear_at = now
-            logger.info(f"🛑 Interrupción del cliente ({reason}): limpiando audio de Twilio")
+            gemini_url = f"{GEMINI_WS_URL}?key={GEMINI_API_KEY}"
+            gemini_ws = await websockets.connect(gemini_url, ping_interval=20, ping_timeout=60)
+            setup = {
+                "setup": {
+                    "model": GEMINI_MODEL,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {"voiceName": "Aoede"}
+                            }
+                        },
+                    },
+                    "systemInstruction": {
+                        "parts": [{"text": session_system_prompt}]
+                    },
+                    "inputAudioTranscription": {},
+                }
+            }
+            await gemini_ws.send(json.dumps(setup))
+            resp = json.loads(await asyncio.wait_for(gemini_ws.recv(), timeout=10))
+            if "setupComplete" not in resp:
+                raise RuntimeError(f"Gemini setup falló: {resp}")
+            logger.info("🤖 Gemini Live conectado")
 
         async def max_duration_hangup():
             await asyncio.sleep(CALL_MAX_SECONDS)
@@ -344,15 +352,23 @@ async def media_stream(websocket: WebSocket):
                         start = data.get("start", {})
                         stream_sid = start.get("streamSid")
                         call_sid = start.get("callSid")
+                        custom_params = start.get("customParameters", {}) or {}
+                        call_context = {
+                            "name": clean_field(custom_params.get("name"), 80),
+                            "company": clean_field(custom_params.get("company"), 140),
+                            "context": clean_field(custom_params.get("context"), 600),
+                        }
                         logger.info(f"📡 Stream: {stream_sid} Call: {call_sid}")
                         if not max_duration_task:
                             max_duration_task = asyncio.create_task(max_duration_hangup())
+                        if not gemini_ws:
+                            await connect_gemini(call_context)
                         # Contexto privado ya va en systemInstruction; aquí solo forzamos el inicio de la llamada.
                         await gemini_ws.send(json.dumps({
                             "clientContent": {
                                 "turns": [{
                                     "role": "user",
-                                    "parts": [{"text": "Inicia la llamada ahora con tu saludo de apertura."}]
+                                    "parts": [{"text": build_opening_instruction(call_context)}]
                                 }],
                                 "turnComplete": True
                             }
@@ -370,7 +386,7 @@ async def media_stream(websocket: WebSocket):
                             barge_in_voice_frames = 0
 
                         if assistant_speaking and barge_in_voice_frames >= BARGE_IN_REQUIRED_FRAMES:
-                            await clear_twilio_audio("voz sostenida")
+                            assistant_speaking = False
                             barge_in_voice_frames = 0
 
                         pcm = audioop.ratecv(pcm, 2, 1, 8000, 16000, None)[0]
@@ -395,6 +411,8 @@ async def media_stream(websocket: WebSocket):
             """Recibe audio de Gemini y envía a Twilio"""
             nonlocal stream_sid, assistant_speaking
             try:
+                while gemini_ws is None:
+                    await asyncio.sleep(0.01)
                 async for message in gemini_ws:
                     data = json.loads(message)
                     sc = data.get("serverContent")
@@ -430,7 +448,7 @@ async def media_stream(websocket: WebSocket):
                             if user_text:
                                 logger.info(f"📝 Cliente: {user_text[:100]}")
                                 if assistant_speaking:
-                                    await clear_twilio_audio("transcripción de voz")
+                                    assistant_speaking = False
                         
                         if sc.get("turnComplete"):
                             assistant_speaking = False
