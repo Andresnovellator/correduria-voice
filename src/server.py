@@ -189,11 +189,12 @@ def clean_field(value, limit: int) -> str:
     return " ".join(value.split())[:limit]
 
 
-def build_call_context_instruction(context: dict[str, str]) -> str:
+def build_call_context_prompt(context: dict[str, str]) -> str:
     name = context.get("name", "")
     company = context.get("company", "")
     notes = context.get("context", "")
-    lines = ["Contexto privado de esta llamada. No inventes datos."]
+    lines = ["DATOS PRIVADOS DE ESTA LLAMADA"]
+    lines.append("Usa estos datos en tu comportamiento, pero sin leerlos de forma literal.")
     if name:
         lines.append(
             f"Nombre de la persona: {name}. Usa este nombre en la apertura y vuelve a usarlo alguna vez si encaja. "
@@ -209,7 +210,7 @@ def build_call_context_instruction(context: dict[str, str]) -> str:
     else:
         opening = "Hola, ¿qué tal? Soy Lucía, de González Ardid, la correduría de Teruel."
 
-    lines.append(f'Empieza ya mismo diciendo exactamente: "{opening}"')
+    lines.append(f'Apertura inicial exacta: "{opening}"')
     return "\n".join(lines)
 
 
@@ -264,6 +265,9 @@ async def media_stream(websocket: WebSocket):
     max_duration_task = None
     ctx_token = websocket.query_params.get("ctx", "")
     call_context = CALL_CONTEXTS.get(ctx_token, {})
+    session_system_prompt = SYSTEM_PROMPT
+    if call_context:
+        session_system_prompt = f"{SYSTEM_PROMPT}\n\n{build_call_context_prompt(call_context)}"
     if call_context:
         logger.info(
             "🧩 Contexto de llamada cargado: "
@@ -289,8 +293,19 @@ async def media_stream(websocket: WebSocket):
                         }
                     },
                 },
+                "realtimeInputConfig": {
+                    "automaticActivityDetection": {
+                        "disabled": False,
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
+                        "prefixPaddingMs": 20,
+                        "silenceDurationMs": 120,
+                    },
+                    "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
+                    "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
+                },
                 "systemInstruction": {
-                    "parts": [{"text": SYSTEM_PROMPT}]
+                    "parts": [{"text": session_system_prompt}]
                 },
                 "inputAudioTranscription": {},
             }
@@ -343,10 +358,14 @@ async def media_stream(websocket: WebSocket):
                         logger.info(f"📡 Stream: {stream_sid} Call: {call_sid}")
                         if not max_duration_task:
                             max_duration_task = asyncio.create_task(max_duration_hangup())
-                        # Enviar saludo cuando Twilio esté listo
+                        # Disparo explícito de apertura para evitar depender del orden de streams en realtimeInput.
                         await gemini_ws.send(json.dumps({
-                            "realtimeInput": {
-                                "text": build_call_context_instruction(call_context)
+                            "clientContent": {
+                                "turns": [{
+                                    "role": "user",
+                                    "parts": [{"text": "Inicia la llamada ahora con tu saludo de apertura."}]
+                                }],
+                                "turnComplete": True
                             }
                         }))
                         logger.info("📤 Saludo enviado a Gemini")
