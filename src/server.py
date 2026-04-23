@@ -293,17 +293,6 @@ async def media_stream(websocket: WebSocket):
                         }
                     },
                 },
-                "realtimeInputConfig": {
-                    "automaticActivityDetection": {
-                        "disabled": False,
-                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
-                        "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
-                        "prefixPaddingMs": 20,
-                        "silenceDurationMs": 120,
-                    },
-                    "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
-                    "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
-                },
                 "systemInstruction": {
                     "parts": [{"text": session_system_prompt}]
                 },
@@ -358,7 +347,7 @@ async def media_stream(websocket: WebSocket):
                         logger.info(f"📡 Stream: {stream_sid} Call: {call_sid}")
                         if not max_duration_task:
                             max_duration_task = asyncio.create_task(max_duration_hangup())
-                        # Disparo explícito de apertura para evitar depender del orden de streams en realtimeInput.
+                        # Contexto privado ya va en systemInstruction; aquí solo forzamos el inicio de la llamada.
                         await gemini_ws.send(json.dumps({
                             "clientContent": {
                                 "turns": [{
